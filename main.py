@@ -6,6 +6,7 @@ import json
 import queue
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from concurrent.futures import ThreadPoolExecutor
 
 # --- Конфигурация и пути ---
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,8 +51,11 @@ class SileroEngine:
     def apply_tts(self, text, speaker, speed):
         cleaned_text = self.clean_text_for_engine(text)
         if not cleaned_text: return None
-        audio_tensor = self.model.apply_tts(text=cleaned_text, speaker=speaker, sample_rate=SAMPLE_RATE)
-        audio = audio_tensor.numpy()
+        # Важно: Silero v4 требует блокировки при обращении из разных потоков
+        with threading.Lock():
+            audio_tensor = self.model.apply_tts(text=cleaned_text, speaker=speaker, sample_rate=SAMPLE_RATE)
+            audio = audio_tensor.numpy()
+        
         audio = self.trim_silence(audio)
         if speed != 1.0:
             import numpy as np
@@ -147,7 +151,6 @@ class App:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Инструментальная панель
         toolbar = ttk.Frame(main_frame)
         toolbar.pack(fill=tk.X, pady=(0, 10))
         
@@ -162,25 +165,20 @@ class App:
         
         self.btns = {}
         for text, cmd in btn_config:
-            btn = ttk.Button(toolbar, text=text, command=cmd, width=12)
+            btn = ttk.Button(toolbar, text=text, command=cmd, width=15)
             btn.pack(side=tk.LEFT, padx=2)
             self.btns[text] = btn
         
         self.btns["▶ Читать"].config(state=tk.DISABLED)
         self.btns["💾 В MP3"].config(state=tk.DISABLED)
         
-        # Фрейм для текста со скроллбаром
         text_frame = ttk.Frame(main_frame)
         text_frame.pack(fill=tk.BOTH, expand=True)
-        
         self.text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Arial", 12), undo=True)
         self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.text_area.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_area.configure(yscrollcommand=scrollbar.set)
-        
-        # Настройка тега для подсветки
         self.text_area.tag_configure("highlight", background="yellow", foreground="black")
 
     def clear_text(self):
@@ -232,21 +230,18 @@ class App:
     def set_highlight(self, start, end):
         self.text_area.tag_remove("highlight", "1.0", tk.END)
         self.text_area.tag_add("highlight", start, end)
-        self.text_area.see(start) # Прокрутка к тексту
+        self.text_area.see(start)
 
     def start_reading(self):
         if self.is_playing or not self.engine: return
         text = self.text_area.get("1.0", tk.END)
         if not text.strip(): return
-        
         self.is_playing = True
         self.is_paused = False
         self.stop_requested = False
         self.btns["▶ Читать"].config(state=tk.DISABLED)
-        
         while not self.audio_queue.empty(): self.audio_queue.get()
         segments = self.split_to_segments(text)
-        
         threading.Thread(target=self._producer_loop, args=(segments,), daemon=True).start()
         threading.Thread(target=self._consumer_loop, args=(segments,), daemon=True).start()
 
@@ -264,20 +259,15 @@ class App:
         for i in range(total):
             if self.stop_requested: break
             audio, seg = self.audio_queue.get()
-            
             while self.is_paused:
                 if self.stop_requested: break
                 time.sleep(0.1)
-            
-            # Подсветка в основном потоке
             self.root.after(0, lambda s=seg: self.set_highlight(s["start_idx"], s["end_idx"]))
-            
             self.status_var.set(f"Читаю: {i+1} из {total}")
             if audio is not None:
                 sd.play(audio, SAMPLE_RATE)
                 sd.wait()
                 if seg["pause"] > 0: time.sleep(seg["pause"])
-        
         self.is_playing = False
         self.root.after(0, lambda: self.btns["▶ Читать"].config(state=tk.NORMAL))
         self.root.after(0, lambda: self.text_area.tag_remove("highlight", "1.0", tk.END))
@@ -300,31 +290,63 @@ class App:
         if not text or not self.engine: return
         file_path = filedialog.asksaveasfilename(defaultextension=".mp3", filetypes=[("MP3 Audio", "*.mp3")])
         if not file_path: return
-        self.status_var.set("Экспорт...")
+        
+        self.btns["💾 В MP3"].config(state=tk.DISABLED)
+        self.status_var.set("Запуск экспорта...")
+        
         def _export():
             try:
                 from pydub import AudioSegment
                 import numpy as np
                 segments = self.split_to_segments(text)
-                combined = AudioSegment.empty()
-                for seg in segments:
+                total = len(segments)
+                speaker = self.settings["voice"]
+                speed = self.settings["speed"]
+                
+                # Создаем список для хранения аудиоданных в правильном порядке
+                results = [None] * total
+                
+                # Функция-воркер для синтеза одного сегмента
+                def process_segment(idx):
+                    seg = segments[idx]
                     try:
-                        audio_data = self.engine.apply_tts(seg["text"], self.settings["voice"], self.settings["speed"])
-                        if audio_data is not None:
-                            y = (audio_data * 32767).astype(np.int16)
-                            combined += AudioSegment(y.tobytes(), frame_rate=SAMPLE_RATE, sample_width=2, channels=1)
-                            if seg["pause"] > 0:
-                                combined += AudioSegment.silent(duration=int(seg["pause"] * 1000), frame_rate=SAMPLE_RATE)
-                    except: continue
+                        audio_data = self.engine.apply_tts(seg["text"], speaker, speed)
+                        # Обновление прогресса в кнопке
+                        processed_count = sum(1 for r in results if r is not None)
+                        percent = int((processed_count / total) * 100)
+                        self.root.after(0, lambda p=percent: self.btns["💾 В MP3"].config(text=f"💾 [{p}%]"))
+                        return audio_data
+                    except: return None
+
+                # Используем ThreadPoolExecutor для параллельного синтеза
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {executor.submit(process_segment, i): i for i in range(total)}
+                    for future in futures:
+                        idx = futures[future]
+                        results[idx] = future.result()
+
+                # Склейка всех сегментов в один файл
+                combined = AudioSegment.empty()
+                for i, audio_data in enumerate(results):
+                    if audio_data is not None:
+                        y = (audio_data * 32767).astype(np.int16)
+                        combined += AudioSegment(y.tobytes(), frame_rate=SAMPLE_RATE, sample_width=2, channels=1)
+                        pause_val = segments[i]["pause"]
+                        if pause_val > 0:
+                            combined += AudioSegment.silent(duration=int(pause_val * 1000), frame_rate=SAMPLE_RATE)
+                
                 combined.export(file_path, format="mp3")
-                self.root.after(0, lambda: messagebox.showinfo("Успех", "Сохранено!"))
-                self.status_var.set("Готов")
+                self.root.after(0, lambda: messagebox.showinfo("Успех", f"Сохранено: {os.path.basename(file_path)}"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            finally:
+                self.root.after(0, lambda: self.btns["💾 В MP3"].config(state=tk.NORMAL, text="💾 В MP3"))
+                self.root.after(0, lambda: self.status_var.set("Готов"))
+        
         threading.Thread(target=_export, daemon=True).start()
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = tk.Tk(className="SileroReader")
     style = ttk.Style()
     if 'clam' in style.theme_names(): style.theme_use('clam')
     app = App(root)
