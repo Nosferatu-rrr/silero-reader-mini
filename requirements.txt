@@ -3,3 +3,4 @@ numpy
 sounddevice
 soundfile
 pydub
+num2words

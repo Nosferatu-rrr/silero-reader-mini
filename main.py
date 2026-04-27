@@ -17,11 +17,12 @@ SAMPLE_RATE = 48000
 
 class SileroEngine:
     def __init__(self, model_path):
-        global torch, np, sd, AudioSegment
+        global torch, np, sd, AudioSegment, num2words
         import torch
         import numpy as np
         import sounddevice as sd
         from pydub import AudioSegment
+        from num2words import num2words
         
         self.device = torch.device('cpu')
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
@@ -34,8 +35,15 @@ class SileroEngine:
         self.speakers = ['aidar', 'baya', 'kseniya', 'xenia', 'eugene']
         self.lock = threading.Lock()
 
+    def replace_numbers(self, text):
+        def replace(match):
+            try: return num2words(match.group(), lang='ru')
+            except: return match.group()
+        return re.sub(r'\d+', replace, text)
+
     def clean_text_for_engine(self, text):
         text = re.sub(r'https?://\S+', ' ссылка ', text)
+        text = self.replace_numbers(text)
         text = text.replace('•', ' ').replace('·', ' ').replace('—', '-')
         text = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?-——:;()"+]', ' ', text)
         text = re.sub(r'\s+', ' ', text)
@@ -55,7 +63,6 @@ class SileroEngine:
         with self.lock:
             audio_tensor = self.model.apply_tts(text=cleaned_text, speaker=speaker, sample_rate=SAMPLE_RATE)
             audio = audio_tensor.numpy()
-        
         audio = self.trim_silence(audio)
         if speed != 1.0:
             import numpy as np
@@ -82,12 +89,15 @@ class App:
         self.audio_queue = queue.Queue(maxsize=3)
         
         self.settings = self.load_settings()
+        self.current_seg_idx = self.settings.get("last_index", 0)
+        
         self.setup_menu()
         self.setup_ui()
         self.load_engine()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_settings(self):
-        defaults = {"voice": "baya", "speed": 1.0, "pause_sent": 0.1, "pause_para": 0.4}
+        defaults = {"voice": "baya", "speed": 1.0, "pause_sent": 0.1, "pause_para": 0.4, "last_index": 0, "last_text": ""}
         if os.path.exists(SETTINGS_PATH):
             try:
                 with open(SETTINGS_PATH, 'r') as f:
@@ -95,18 +105,57 @@ class App:
             except: pass
         return defaults
 
-    def save_settings(self, *args):
+    def save_settings(self):
         try:
+            self.settings["last_text"] = self.text_area.get("1.0", tk.END).strip()
+            self.settings["last_index"] = self.current_seg_idx
             with open(SETTINGS_PATH, 'w') as f:
                 json.dump(self.settings, f)
         except: pass
 
+    def on_close(self):
+        self.stop_requested = True
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except: pass
+        self.save_settings()
+        self.root.destroy()
+
     def setup_menu(self):
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
+        
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+        file_menu.add_command(label="Открыть .txt", command=self.open_file)
+        file_menu.add_separator()
+        file_menu.add_command(label="Выход", command=self.on_close)
+
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Настройки", menu=settings_menu)
         settings_menu.add_command(label="Голос и паузы", command=self.open_settings_dialog)
+
+    def open_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if file_path:
+            try:
+                content = ""
+                # Пробуем разные кодировки
+                for enc in ['utf-8', 'windows-1251']:
+                    try:
+                        with open(file_path, 'r', encoding=enc) as f:
+                            content = f.read()
+                        break
+                    except UnicodeDecodeError: continue
+                
+                if content:
+                    self.clear_text()
+                    self.text_area.insert("1.0", content)
+                    self.text_area.edit_modified(False)
+                    self.status_var.set(f"Загружен файл: {os.path.basename(file_path)}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось прочитать файл: {e}")
 
     def open_settings_dialog(self):
         dialog = tk.Toplevel(self.root)
@@ -177,14 +226,21 @@ class App:
         self.text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Arial", 12), undo=True)
         self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Контекстное меню (ПКМ)
+        if self.settings["last_text"]:
+            self.text_area.insert("1.0", self.settings["last_text"])
+            self.text_area.edit_modified(False)
+            if self.current_seg_idx > 0:
+                self.btns["▶ Читать"].config(text="▶ Продолжить")
+
+        self.text_area.bind("<<Modified>>", self.on_text_modified)
+        self.text_area.bind("<ButtonRelease-1>", self.on_click_set_position)
+        
         self.context_menu = tk.Menu(self.text_area, tearoff=0)
         self.context_menu.add_command(label="Вырезать", command=lambda: self.text_area.event_generate("<<Cut>>"))
         self.context_menu.add_command(label="Копировать", command=lambda: self.text_area.event_generate("<<Copy>>"))
         self.context_menu.add_command(label="Вставить", command=lambda: self.text_area.event_generate("<<Paste>>"))
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Выделить всё", command=lambda: self.text_area.tag_add("sel", "1.0", tk.END))
-        
         self.text_area.bind("<Button-3>", lambda e: self.context_menu.post(e.x_root, e.y_root))
 
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.text_area.yview)
@@ -192,15 +248,42 @@ class App:
         self.text_area.configure(yscrollcommand=scrollbar.set)
         self.text_area.tag_configure("highlight", background="yellow", foreground="black")
 
+    def on_click_set_position(self, event):
+        if self.is_playing: return
+        cursor_idx = self.text_area.index(tk.INSERT)
+        text = self.text_area.get("1.0", tk.END)
+        segments = self.split_to_segments(text)
+        for i, seg in enumerate(segments):
+            if self.text_area.compare(cursor_idx, ">=", seg["start_idx"]) and \
+               self.text_area.compare(cursor_idx, "<", seg["end_idx"]):
+                self.current_seg_idx = i
+                self.btns["▶ Читать"].config(text="▶ Продолжить")
+                self.status_var.set(f"Начнем с предложения №{i+1}")
+                self.save_settings()
+                break
+
+    def on_text_modified(self, event):
+        if self.text_area.edit_modified():
+            self.current_seg_idx = 0
+            self.btns["▶ Читать"].config(text="▶ Читать")
+            self.text_area.edit_modified(False)
+
     def clear_text(self):
         self.stop_reading()
+        self.current_seg_idx = 0
         self.text_area.tag_remove("highlight", "1.0", tk.END)
         self.text_area.delete("1.0", tk.END)
+        self.btns["▶ Читать"].config(text="▶ Читать")
+        self.save_settings()
 
     def paste_text(self):
         try:
             text = self.root.clipboard_get()
-            if text: self.text_area.insert(tk.INSERT, text)
+            if text: 
+                self.text_area.insert(tk.INSERT, text)
+                self.current_seg_idx = 0
+                self.btns["▶ Читать"].config(text="▶ Читать")
+                self.save_settings()
         except: pass
 
     def load_engine(self):
@@ -251,52 +334,65 @@ class App:
         self.is_playing = True
         self.is_paused = False
         self.stop_requested = False
-        self.btns["▶ Читать"].config(state=tk.DISABLED)
-        while not self.audio_queue.empty(): self.audio_queue.get()
+        self.btns["▶ Читать"].config(state=tk.DISABLED, text="▶ Читать")
+        while not self.audio_queue.empty():
+            try: self.audio_queue.get_nowait()
+            except: break
         segments = self.split_to_segments(text)
-        threading.Thread(target=self._producer_loop, args=(segments,), daemon=True).start()
-        threading.Thread(target=self._consumer_loop, args=(segments,), daemon=True).start()
+        if self.current_seg_idx >= len(segments): self.current_seg_idx = 0
+        threading.Thread(target=self._producer_loop, args=(segments[self.current_seg_idx:],), daemon=True).start()
+        threading.Thread(target=self._consumer_loop, args=(segments, self.current_seg_idx), daemon=True).start()
 
-    def _producer_loop(self, segments):
-        for seg in segments:
+    def _producer_loop(self, segments_to_read):
+        speaker = self.settings["voice"]
+        speed = self.settings["speed"]
+        for seg in segments_to_read:
             if self.stop_requested: break
             try:
-                audio = self.engine.apply_tts(seg["text"], self.settings["voice"], self.settings["speed"])
-                if self.stop_requested: break
-                self.audio_queue.put((audio, seg))
-            except: 
-                self.audio_queue.put((None, seg))
+                audio = self.engine.apply_tts(seg["text"], speaker, speed)
+                while not self.stop_requested:
+                    try:
+                        self.audio_queue.put((audio, seg), timeout=0.1)
+                        break
+                    except queue.Full: continue
+            except:
+                if not self.stop_requested: self.audio_queue.put((None, seg), timeout=0.1)
 
-    def _consumer_loop(self, segments):
+    def _consumer_loop(self, segments, start_idx):
         import sounddevice as sd
         total = len(segments)
         try:
-            for i in range(total):
+            for i in range(start_idx, total):
                 if self.stop_requested: break
                 audio, seg = None, None
                 while not self.stop_requested:
                     try:
                         audio, seg = self.audio_queue.get(timeout=0.1)
                         break
-                    except queue.Empty:
-                        continue
+                    except queue.Empty: continue
                 if self.stop_requested or (audio is None and seg is None): break
-                while self.is_paused:
-                    if self.stop_requested: break
-                    time.sleep(0.1)
+                while self.is_paused and not self.stop_requested: time.sleep(0.1)
                 if self.stop_requested: break
+                self.current_seg_idx = i
+                if i % 5 == 0: self.save_settings()
                 self.root.after(0, lambda s=seg: self.set_highlight(s["start_idx"], s["end_idx"]))
                 self.status_var.set(f"Читаю: {i+1} из {total}")
                 if audio is not None:
                     sd.play(audio, SAMPLE_RATE)
-                    sd.wait()
-                    if seg["pause"] > 0 and not self.stop_requested: 
-                        time.sleep(seg["pause"])
+                    while sd.get_stream().active and not self.stop_requested: time.sleep(0.05)
+                    if self.stop_requested: sd.stop(); break
+                    if seg["pause"] > 0: time.sleep(seg["pause"])
+            if not self.stop_requested: self.current_seg_idx = 0
         finally:
             self.is_playing = False
-            self.root.after(0, lambda: self.btns["▶ Читать"].config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.text_area.tag_remove("highlight", "1.0", tk.END))
-            self.status_var.set("Готов")
+            self.save_settings()
+            self.root.after(0, self._reset_ui_after_reading)
+
+    def _reset_ui_after_reading(self):
+        text = "▶ Продолжить" if self.current_seg_idx > 0 else "▶ Читать"
+        self.btns["▶ Читать"].config(state=tk.NORMAL, text=text)
+        self.text_area.tag_remove("highlight", "1.0", tk.END)
+        self.status_var.set("Готов")
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
@@ -305,15 +401,15 @@ class App:
     def stop_reading(self):
         self.stop_requested = True
         self.is_paused = False
+        self.current_seg_idx = 0 
+        self.btns["▶ Читать"].config(text="▶ Читать")
         try:
             while not self.audio_queue.empty(): self.audio_queue.get_nowait()
+            self.audio_queue.put_nowait((None, None))
         except: pass
-        try: self.audio_queue.put_nowait((None, None))
+        try: import sounddevice as sd; sd.stop()
         except: pass
-        try:
-            import sounddevice as sd
-            sd.stop()
-        except: pass
+        self.save_settings()
 
     def export_mp3(self):
         text = self.text_area.get("1.0", tk.END).strip()
@@ -328,13 +424,11 @@ class App:
                 import numpy as np
                 segments = self.split_to_segments(text)
                 total = len(segments)
-                speaker = self.settings["voice"]
-                speed = self.settings["speed"]
                 results = [None] * total
                 def process_segment(idx):
                     seg = segments[idx]
                     try:
-                        audio_data = self.engine.apply_tts(seg["text"], speaker, speed)
+                        audio_data = self.engine.apply_tts(seg["text"], self.settings["voice"], self.settings["speed"])
                         processed_count = sum(1 for r in results if r is not None)
                         percent = int((processed_count / total) * 100)
                         self.root.after(0, lambda p=percent: self.btns["💾 В MP3"].config(text=f"💾 [{p}%]"))
@@ -350,9 +444,8 @@ class App:
                     if audio_data is not None:
                         y = (audio_data * 32767).astype(np.int16)
                         combined += AudioSegment(y.tobytes(), frame_rate=SAMPLE_RATE, sample_width=2, channels=1)
-                        pause_val = segments[i]["pause"]
-                        if pause_val > 0:
-                            combined += AudioSegment.silent(duration=int(pause_val * 1000), frame_rate=SAMPLE_RATE)
+                        if segments[i]["pause"] > 0:
+                            combined += AudioSegment.silent(duration=int(segments[i]["pause"] * 1000), frame_rate=SAMPLE_RATE)
                 combined.export(file_path, format="mp3")
                 self.root.after(0, lambda: messagebox.showinfo("Успех", f"Сохранено: {os.path.basename(file_path)}"))
             except Exception as e:
