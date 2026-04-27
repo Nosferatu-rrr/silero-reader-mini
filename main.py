@@ -32,6 +32,7 @@ class SileroEngine:
         self.model = torch.package.PackageImporter(model_path).load_pickle("tts_models", "model")
         self.model.to(self.device)
         self.speakers = ['aidar', 'baya', 'kseniya', 'xenia', 'eugene']
+        self.lock = threading.Lock()
 
     def clean_text_for_engine(self, text):
         text = re.sub(r'https?://\S+', ' ссылка ', text)
@@ -51,8 +52,7 @@ class SileroEngine:
     def apply_tts(self, text, speaker, speed):
         cleaned_text = self.clean_text_for_engine(text)
         if not cleaned_text: return None
-        # Важно: Silero v4 требует блокировки при обращении из разных потоков
-        with threading.Lock():
+        with self.lock:
             audio_tensor = self.model.apply_tts(text=cleaned_text, speaker=speaker, sample_rate=SAMPLE_RATE)
             audio = audio_tensor.numpy()
         
@@ -176,12 +176,24 @@ class App:
         text_frame.pack(fill=tk.BOTH, expand=True)
         self.text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Arial", 12), undo=True)
         self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Контекстное меню (ПКМ)
+        self.context_menu = tk.Menu(self.text_area, tearoff=0)
+        self.context_menu.add_command(label="Вырезать", command=lambda: self.text_area.event_generate("<<Cut>>"))
+        self.context_menu.add_command(label="Копировать", command=lambda: self.text_area.event_generate("<<Copy>>"))
+        self.context_menu.add_command(label="Вставить", command=lambda: self.text_area.event_generate("<<Paste>>"))
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Выделить всё", command=lambda: self.text_area.tag_add("sel", "1.0", tk.END))
+        
+        self.text_area.bind("<Button-3>", lambda e: self.context_menu.post(e.x_root, e.y_root))
+
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.text_area.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_area.configure(yscrollcommand=scrollbar.set)
         self.text_area.tag_configure("highlight", background="yellow", foreground="black")
 
     def clear_text(self):
+        self.stop_reading()
         self.text_area.tag_remove("highlight", "1.0", tk.END)
         self.text_area.delete("1.0", tk.END)
 
@@ -250,28 +262,41 @@ class App:
             if self.stop_requested: break
             try:
                 audio = self.engine.apply_tts(seg["text"], self.settings["voice"], self.settings["speed"])
+                if self.stop_requested: break
                 self.audio_queue.put((audio, seg))
-            except: self.audio_queue.put((None, seg))
+            except: 
+                self.audio_queue.put((None, seg))
 
     def _consumer_loop(self, segments):
         import sounddevice as sd
         total = len(segments)
-        for i in range(total):
-            if self.stop_requested: break
-            audio, seg = self.audio_queue.get()
-            while self.is_paused:
+        try:
+            for i in range(total):
                 if self.stop_requested: break
-                time.sleep(0.1)
-            self.root.after(0, lambda s=seg: self.set_highlight(s["start_idx"], s["end_idx"]))
-            self.status_var.set(f"Читаю: {i+1} из {total}")
-            if audio is not None:
-                sd.play(audio, SAMPLE_RATE)
-                sd.wait()
-                if seg["pause"] > 0: time.sleep(seg["pause"])
-        self.is_playing = False
-        self.root.after(0, lambda: self.btns["▶ Читать"].config(state=tk.NORMAL))
-        self.root.after(0, lambda: self.text_area.tag_remove("highlight", "1.0", tk.END))
-        self.status_var.set("Готов")
+                audio, seg = None, None
+                while not self.stop_requested:
+                    try:
+                        audio, seg = self.audio_queue.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        continue
+                if self.stop_requested or (audio is None and seg is None): break
+                while self.is_paused:
+                    if self.stop_requested: break
+                    time.sleep(0.1)
+                if self.stop_requested: break
+                self.root.after(0, lambda s=seg: self.set_highlight(s["start_idx"], s["end_idx"]))
+                self.status_var.set(f"Читаю: {i+1} из {total}")
+                if audio is not None:
+                    sd.play(audio, SAMPLE_RATE)
+                    sd.wait()
+                    if seg["pause"] > 0 and not self.stop_requested: 
+                        time.sleep(seg["pause"])
+        finally:
+            self.is_playing = False
+            self.root.after(0, lambda: self.btns["▶ Читать"].config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.text_area.tag_remove("highlight", "1.0", tk.END))
+            self.status_var.set("Готов")
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
@@ -280,6 +305,11 @@ class App:
     def stop_reading(self):
         self.stop_requested = True
         self.is_paused = False
+        try:
+            while not self.audio_queue.empty(): self.audio_queue.get_nowait()
+        except: pass
+        try: self.audio_queue.put_nowait((None, None))
+        except: pass
         try:
             import sounddevice as sd
             sd.stop()
@@ -290,10 +320,8 @@ class App:
         if not text or not self.engine: return
         file_path = filedialog.asksaveasfilename(defaultextension=".mp3", filetypes=[("MP3 Audio", "*.mp3")])
         if not file_path: return
-        
         self.btns["💾 В MP3"].config(state=tk.DISABLED)
         self.status_var.set("Запуск экспорта...")
-        
         def _export():
             try:
                 from pydub import AudioSegment
@@ -302,30 +330,21 @@ class App:
                 total = len(segments)
                 speaker = self.settings["voice"]
                 speed = self.settings["speed"]
-                
-                # Создаем список для хранения аудиоданных в правильном порядке
                 results = [None] * total
-                
-                # Функция-воркер для синтеза одного сегмента
                 def process_segment(idx):
                     seg = segments[idx]
                     try:
                         audio_data = self.engine.apply_tts(seg["text"], speaker, speed)
-                        # Обновление прогресса в кнопке
                         processed_count = sum(1 for r in results if r is not None)
                         percent = int((processed_count / total) * 100)
                         self.root.after(0, lambda p=percent: self.btns["💾 В MP3"].config(text=f"💾 [{p}%]"))
                         return audio_data
                     except: return None
-
-                # Используем ThreadPoolExecutor для параллельного синтеза
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     futures = {executor.submit(process_segment, i): i for i in range(total)}
                     for future in futures:
                         idx = futures[future]
                         results[idx] = future.result()
-
-                # Склейка всех сегментов в один файл
                 combined = AudioSegment.empty()
                 for i, audio_data in enumerate(results):
                     if audio_data is not None:
@@ -334,7 +353,6 @@ class App:
                         pause_val = segments[i]["pause"]
                         if pause_val > 0:
                             combined += AudioSegment.silent(duration=int(pause_val * 1000), frame_rate=SAMPLE_RATE)
-                
                 combined.export(file_path, format="mp3")
                 self.root.after(0, lambda: messagebox.showinfo("Успех", f"Сохранено: {os.path.basename(file_path)}"))
             except Exception as e:
@@ -342,7 +360,6 @@ class App:
             finally:
                 self.root.after(0, lambda: self.btns["💾 В MP3"].config(state=tk.NORMAL, text="💾 В MP3"))
                 self.root.after(0, lambda: self.status_var.set("Готов"))
-        
         threading.Thread(target=_export, daemon=True).start()
 
 if __name__ == "__main__":
