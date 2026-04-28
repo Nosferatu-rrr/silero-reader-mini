@@ -10,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Конфигурация и пути ---
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(PROJECT_DIR, "models", "v4_ru.pt")
-MODEL_URL = "https://models.silero.ai/models/tts/ru/v4_ru.pt"
+MODEL_PATH = os.path.join(PROJECT_DIR, "models", "v5_ru.pt")
+MODEL_URL = "https://models.silero.ai/models/tts/ru/v5_ru.pt"
 SETTINGS_PATH = os.path.join(PROJECT_DIR, "settings.json")
 SAMPLE_RATE = 48000
 
@@ -35,6 +35,19 @@ class SileroEngine:
         self.speakers = ['aidar', 'baya', 'kseniya', 'xenia', 'eugene']
         self.lock = threading.Lock()
 
+    def transliterate_latin(self, text):
+        chars = {
+            'a': 'а', 'b': 'б', 'c': 'к', 'd': 'д', 'e': 'е', 'f': 'ф', 'g': 'г', 'h': 'х', 'i': 'и', 'j': 'дж',
+            'k': 'к', 'l': 'л', 'm': 'м', 'n': 'н', 'o': 'о', 'p': 'п', 'q': 'кв', 'r': 'р', 's': 'с', 't': 'т',
+            'u': 'у', 'v': 'в', 'w': 'в', 'x': 'кс', 'y': 'й', 'z': 'з',
+            'A': 'А', 'B': 'Б', 'C': 'К', 'D': 'Д', 'E': 'Е', 'F': 'Ф', 'G': 'Г', 'H': 'Х', 'I': 'И', 'J': 'Дж',
+            'K': 'К', 'L': 'Л', 'M': 'М', 'N': 'Н', 'O': 'О', 'P': 'П', 'Q': 'Кв', 'R': 'Р', 'S': 'С', 'T': 'Т',
+            'U': 'У', 'V': 'В', 'W': 'В', 'X': 'Кс', 'Y': 'Й', 'Z': 'З'
+        }
+        for lat, cyr in chars.items():
+            text = text.replace(lat, cyr)
+        return text
+
     def replace_numbers(self, text):
         def replace(match):
             try: return num2words(match.group(), lang='ru')
@@ -43,9 +56,11 @@ class SileroEngine:
 
     def clean_text_for_engine(self, text):
         text = re.sub(r'https?://\S+', ' ссылка ', text)
+        text = re.sub(r'@(\S+)', r'собачка \1', text)
         text = self.replace_numbers(text)
+        text = self.transliterate_latin(text)
         text = text.replace('•', ' ').replace('·', ' ').replace('—', '-')
-        text = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?-——:;()"+]', ' ', text)
+        text = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?:;()\"+\-—]', ' ', text)
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
 
@@ -141,7 +156,6 @@ class App:
         if file_path:
             try:
                 content = ""
-                # Пробуем разные кодировки
                 for enc in ['utf-8', 'windows-1251']:
                     try:
                         with open(file_path, 'r', encoding=enc) as f:
@@ -168,8 +182,11 @@ class App:
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text="Голос:").grid(row=0, column=0, sticky=tk.W, pady=5)
         voice_var = tk.StringVar(value=self.settings["voice"])
-        voice_combo = ttk.Combobox(frame, textvariable=voice_var, state="readonly", values=self.engine.speakers if self.engine else [])
+        
+        speakers = self.engine.speakers if self.engine else ['aidar', 'baya', 'kseniya', 'xenia', 'eugene']
+        voice_combo = ttk.Combobox(frame, textvariable=voice_var, state="readonly", values=speakers)
         voice_combo.grid(row=0, column=1, sticky=tk.EW, pady=5)
+        
         ttk.Label(frame, text="Скорость:").grid(row=1, column=0, sticky=tk.W, pady=5)
         speed_scale = ttk.Scale(frame, from_=0.5, to=2.0, orient=tk.HORIZONTAL)
         speed_scale.set(self.settings["speed"])

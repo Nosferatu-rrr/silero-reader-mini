@@ -4,3 +4,4 @@ sounddevice
 soundfile
 pydub
 num2words
+scipy
