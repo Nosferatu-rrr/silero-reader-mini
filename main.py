@@ -322,12 +322,16 @@ class App:
         lines = text.split('\n')
         for line_num, line in enumerate(lines, 1):
             if not line.strip(): continue
-            sentences = re.split(r'(?<=[.!?])\s+', line)
+            line_cleaned = re.sub(r'(?<=\.)\s+(?=\.)', '[DOT]', line)
+            sentences = re.split(r'(?<=[.!?])\s+', line_cleaned)
             curr_col = 0
             for i, s in enumerate(sentences):
+                s = s.replace('[DOT]', ' .')
                 s_trimmed = s.strip()
-                if s_trimmed:
+                if s_trimmed and not re.match(r"^[.!?\s]+$", s_trimmed):
                     start_col = line.find(s, curr_col)
+                    if start_col == -1:
+                        start_col = curr_col
                     end_col = start_col + len(s)
                     is_last = (i == len(sentences) - 1)
                     segments.append({
