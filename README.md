@@ -18,19 +18,24 @@
 ## Установка и запуск (Linux)
 
 ### 1. Требования
-Необходим Python 3.10+, установленный пакет `ffmpeg` (для экспорта в MP3) и библиотеки для работы с аудио.
+Необходим Python 3.10+, установленный `ffmpeg` (для экспорта в MP3) и библиотеки для работы с аудио.
 
 ```bash
 sudo apt update && sudo apt install ffmpeg libportaudio2
 ```
 
+Установите менеджер пакетов [uv](https://github.com/astral-sh/uv):
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
 ### 2. Установка
 ```bash
-git clone https://github.com/Nosferatu-rrr/silero-reader-mini.git
-cd silero-reader-mini
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+# Создание виртуального окружения через uv
+uv venv
+
+# Установка зависимостей
+uv pip install -r requirements.txt
 ```
 
 ### 3. Запуск
