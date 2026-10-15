@@ -4,36 +4,75 @@ import threading
 import time
 import json
 import queue
+import urllib.request
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Конфигурация и пути ---
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(PROJECT_DIR, "models", "v5_ru.pt")
-MODEL_URL = "https://models.silero.ai/models/tts/ru/v5_ru.pt"
+MODELS_DIR = os.path.join(PROJECT_DIR, "models")
 SETTINGS_PATH = os.path.join(PROJECT_DIR, "settings.json")
 SAMPLE_RATE = 48000
 
+# Реестр доступных моделей: версия -> URL для загрузки.
+# Это офлайн-фолбэк: список работает без интернета.
+# Чтобы добавить новую версию вручную, достаточно дописать одну строку сюда.
+AVAILABLE_MODELS = {
+    "v5_6_ru": "https://models.silero.ai/models/tts/ru/v5_6_ru.pt",
+    "v5_5_ru": "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
+    "v5_4_ru": "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
+    "v5_3_ru": "https://models.silero.ai/models/tts/ru/v5_3_ru.pt",
+    "v5_2_ru": "https://models.silero.ai/models/tts/ru/v5_2_ru.pt",
+    "v5_ru": "https://models.silero.ai/models/tts/ru/v5_ru.pt",
+    "v4_ru": "https://models.silero.ai/models/tts/ru/v4_ru.pt",
+}
+DEFAULT_MODEL = "v5_6_ru"
+
+# Официальный список моделей Silero — единственный источник новых версий.
+MODELS_YML_URL = "https://raw.githubusercontent.com/snakers4/silero-models/master/models.yml"
+
+
+def fetch_available_models(timeout=10):
+    """Скачивает models.yml и возвращает {версия: url} для русских TTS-моделей."""
+    req = urllib.request.Request(MODELS_YML_URL, headers={"User-Agent": "SileroReaderMini"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8", errors="ignore")
+    found = {}
+    for url, version in re.findall(
+        r"package:\s*'?(https://models\.silero\.ai/models/tts/ru/(v\d+(?:_\d+)?_ru)\.pt)'?",
+        text,
+    ):
+        found[version] = url
+    return found
+
 class SileroEngine:
-    def __init__(self, model_path):
+    def __init__(self, model_version):
         global torch, np, sd, AudioSegment, num2words
         import torch
         import numpy as np
         import sounddevice as sd
         from pydub import AudioSegment
         from num2words import num2words
-        
+
         self.device = torch.device('cpu')
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        if not os.path.exists(model_path):
-            torch.hub.download_url_to_file(MODEL_URL, model_path)
-            
-        import torch.package
-        self.model = torch.package.PackageImporter(model_path).load_pickle("tts_models", "model")
+        self.model_version = model_version
+        self.model = self._load_model(model_version)
         self.model.to(self.device)
         self.speakers = ['aidar', 'baya', 'kseniya', 'xenia', 'eugene']
         self.lock = threading.Lock()
+
+    def _load_model(self, model_version):
+        import torch
+        import torch.package
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        model_path = os.path.join(MODELS_DIR, f"{model_version}.pt")
+        if not os.path.exists(model_path):
+            url = AVAILABLE_MODELS.get(model_version)
+            if not url:
+                raise ValueError(f"Неизвестная версия модели: {model_version}")
+            torch.hub.download_url_to_file(url, model_path)
+        return torch.package.PackageImporter(model_path).load_pickle("tts_models", "model")
 
     def transliterate_latin(self, text):
         chars = {
@@ -105,6 +144,7 @@ class App:
         
         self.settings = self.load_settings()
         self.current_seg_idx = self.settings.get("last_index", 0)
+        self._fallback_attempted = False
         
         self.setup_menu()
         self.setup_ui()
@@ -112,7 +152,8 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_settings(self):
-        defaults = {"voice": "baya", "speed": 1.0, "pause_sent": 0.1, "pause_para": 0.4, "last_index": 0, "last_text": ""}
+        defaults = {"voice": "baya", "speed": 1.0, "pause_sent": 0.1, "pause_para": 0.4,
+                    "last_index": 0, "last_text": "", "model": DEFAULT_MODEL}
         if os.path.exists(SETTINGS_PATH):
             try:
                 with open(SETTINGS_PATH, 'r') as f:
@@ -150,6 +191,70 @@ class App:
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Настройки", menu=settings_menu)
         settings_menu.add_command(label="Голос и паузы", command=self.open_settings_dialog)
+
+        model_menu = tk.Menu(settings_menu, tearoff=0)
+        settings_menu.add_cascade(label="Модель", menu=model_menu)
+        self.model_menu = model_menu
+        self.model_var = tk.StringVar(value=self.settings["model"])
+        self._rebuild_model_menu()
+
+    def _rebuild_model_menu(self):
+        # Пересобирает список версий, сохраняя разделитель и пункт проверки.
+        self.model_menu.delete(0, tk.END)
+        for version in AVAILABLE_MODELS:
+            self.model_menu.add_radiobutton(
+                label=version,
+                value=version,
+                variable=self.model_var,
+                command=lambda v=version: self.switch_model(v),
+            )
+        self.model_menu.add_separator()
+        self.model_menu.add_command(label="Проверить обновления", command=self.check_updates)
+
+    def check_updates(self):
+        self.status_var.set("Проверка обновлений...")
+        def _check():
+            try:
+                remote = fetch_available_models()
+                new_versions = [v for v in remote if v not in AVAILABLE_MODELS]
+                AVAILABLE_MODELS.update(remote)
+                self.root.after(0, lambda: self._on_updates_checked(new_versions))
+            except Exception as e:
+                self.root.after(0, lambda: self.status_var.set(f"Не удалось проверить обновления: {e}"))
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _on_updates_checked(self, new_versions):
+        self._rebuild_model_menu()
+        if new_versions:
+            self.status_var.set(f"Добавлены версии: {', '.join(new_versions)}")
+        else:
+            self.status_var.set("Новых версий не найдено")
+
+    def switch_model(self, version):
+        if version == self.settings["model"] and self.engine is not None:
+            return
+        self.settings["model"] = version
+        self.save_settings()
+        self.engine = None
+        self._fallback_attempted = False
+        self.btns["▶ Читать"].config(state=tk.DISABLED)
+        self.btns["💾 В MP3"].config(state=tk.DISABLED)
+        self.status_var.set(f"Загрузка модели {version}...")
+        self.load_engine()
+
+    def _on_engine_error(self, version):
+        # Откат на предыдущую рабочую модель, если новая не загрузилась.
+        # Повторная попытка делается только один раз, чтобы избежать цикла.
+        if not self._fallback_attempted:
+            self._fallback_attempted = True
+            fallback = DEFAULT_MODEL if version != DEFAULT_MODEL else "v5_ru"
+            self.settings["model"] = fallback
+            self.model_var.set(fallback)
+            self.save_settings()
+            self.status_var.set(f"Ошибка модели {version}, откат на {fallback}")
+            self.load_engine()
+        else:
+            self.status_var.set(f"Не удалось загрузить модель {version}")
 
     def open_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
@@ -304,18 +409,19 @@ class App:
         except: pass
 
     def load_engine(self):
+        version = self.settings["model"]
         def _load():
             try:
-                self.engine = SileroEngine(MODEL_PATH)
+                self.engine = SileroEngine(version)
                 self.root.after(0, self._on_engine_ready)
-            except:
-                self.root.after(0, lambda: self.status_var.set("Ошибка загрузки"))
+            except Exception:
+                self.root.after(0, lambda: self._on_engine_error(version))
         threading.Thread(target=_load, daemon=True).start()
 
     def _on_engine_ready(self):
         self.btns["▶ Читать"].config(state=tk.NORMAL)
         self.btns["💾 В MP3"].config(state=tk.NORMAL)
-        self.status_var.set("Готов")
+        self.status_var.set(f"Готов ({self.settings['model']})")
 
     def split_to_segments(self, text):
         segments = []

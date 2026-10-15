@@ -11,6 +11,9 @@ models/
 settings.json
 log.txt
 
+# Журнал разработки (локальный)
+DEVELOPER_LOG.md
+
 # Кэш Python
 __pycache__/
 *.pyc
