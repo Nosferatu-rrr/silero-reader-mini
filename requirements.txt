@@ -5,3 +5,4 @@ soundfile
 pydub
 num2words
 scipy
+audioop-lts; python_version >= "3.13"

@@ -16,14 +16,15 @@
 ## Установка
 
 ```bash
-sudo apt install ffmpeg libportaudio2
+sudo apt install ffmpeg libportaudio2 python3-tk
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-uv python install 3.12
-uv venv --python 3.12
+uv venv --python /usr/bin/python3
 uv pip install -r requirements.txt
 uv pip install --index-url https://download.pytorch.org/whl/cpu --reinstall-package torch torch
 ```
+
+Окружение создаётся на системном Python: он использует Tk с Xft, поэтому шрифты отображаются корректно.
 
 ## Запуск
 
