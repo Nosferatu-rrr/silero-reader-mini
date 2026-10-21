@@ -20,7 +20,7 @@
 ## Установка и запуск (Linux)
 
 ### 1. Требования
-Необходим Python 3.10+, установленный `ffmpeg` (для экспорта в MP3) и библиотеки для работы с аудио.
+Необходим Python 3.12, установленный `ffmpeg` (для экспорта в MP3) и библиотеки для работы с аудио.
 
 ```bash
 sudo apt update && sudo apt install ffmpeg libportaudio2
@@ -33,12 +33,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### 2. Установка
 ```bash
-# Создание виртуального окружения через uv
-uv venv
+# Python 3.12 (если в системе другая версия)
+uv python install 3.12
 
-# Установка зависимостей
+# Создание виртуального окружения через uv
+uv venv --python 3.12
+
+# Установка зависимостей (CPU-сборка torch, без CUDA)
 uv pip install -r requirements.txt
+uv pip install --index-url https://download.pytorch.org/whl/cpu --reinstall-package torch torch
 ```
+
+> **Важно:** версия Python в окружении должна совпадать с той, на которой создавался `venv`. После обновления системы `/usr/bin/python3` может смениться (например, 3.12 → 3.14), и тогда `venv/bin/python` начнёт указывать на новый интерпретатор, а пакеты останутся в каталоге старой версии — приложение перестанет видеть модели. Проверка: `venv/bin/python -V`.
 
 ### 3. Запуск
 ```bash
@@ -67,6 +73,27 @@ AVAILABLE_MODELS = {
 ### Проверка обновлений
 
 Пункт **Настройки → Модель → Проверить обновления** скачивает официальный список `models.yml` из репозитория `snakers4/silero-models` и автоматически добавляет в меню новые версии русских моделей. Так приложение не отстаёт от релизов, но продолжает работать и без интернета (на статическом списке).
+
+## Устранение неполадок
+
+**«Не удалось загрузить модель» при выборе любой версии.**
+Проверьте, что окружение видит torch:
+
+```bash
+./venv/bin/python -c "import torch; print(torch.__version__)"
+```
+
+Если выводится `ModuleNotFoundError`, значит `venv` создан на другой версии Python, чем та, на которую указывает `venv/bin/python` (типично после обновления Ubuntu). Лечится пересозданием окружения:
+
+```bash
+mv venv venv.broken
+uv venv --python 3.12 venv
+uv pip install --python venv/bin/python -r requirements.txt
+uv pip install --python venv/bin/python --index-url https://download.pytorch.org/whl/cpu --reinstall-package torch torch
+```
+
+**Модель загружается, но интерфейс остаётся в «Запуск...».**
+В сборке Tk 9.0 из Ubuntu отключена поддержка потоков (`tcl_platform(threaded)` отсутствует), поэтому `root.after()` из фонового потока не выполняется. В актуальном `main.py` все обновления UI идут через очередь `ui_queue` (`post_ui()`), проблема устранена. Если вы откатываетесь на старый код — обновитесь до текущей версии.
 
 ## Лицензия
 MIT

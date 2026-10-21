@@ -72,7 +72,15 @@ class SileroEngine:
             if not url:
                 raise ValueError(f"Неизвестная версия модели: {model_version}")
             torch.hub.download_url_to_file(url, model_path)
-        return torch.package.PackageImporter(model_path).load_pickle("tts_models", "model")
+        try:
+            return torch.package.PackageImporter(model_path).load_pickle("tts_models", "model")
+        except Exception:
+            # Битый или недокачанный файл: удаляем, чтобы следующая попытка скачала заново.
+            try:
+                os.remove(model_path)
+            except OSError:
+                pass
+            raise
 
     def transliterate_latin(self, text):
         chars = {
@@ -141,6 +149,10 @@ class App:
         self.is_paused = False
         self.stop_requested = False
         self.audio_queue = queue.Queue(maxsize=3)
+        # Tk 9.0 в Ubuntu собран без потоков: root.after() из чужого потока
+        # не выполняется. Поэтому UI-обновления складываем в очередь,
+        # а разбираем её в главном потоке.
+        self.ui_queue = queue.Queue()
         
         self.settings = self.load_settings()
         self.current_seg_idx = self.settings.get("last_index", 0)
@@ -148,8 +160,28 @@ class App:
         
         self.setup_menu()
         self.setup_ui()
+        self.root.after(50, self._drain_ui_queue)
         self.load_engine()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def post_ui(self, fn, *args, **kwargs):
+        """Потокобезопасно ставит вызов в очередь для главного потока Tk."""
+        self.ui_queue.put((fn, args, kwargs))
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                fn, args, kwargs = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                pass
+        try:
+            self.root.after(50, self._drain_ui_queue)
+        except tk.TclError:
+            pass
 
     def load_settings(self):
         defaults = {"voice": "baya", "speed": 1.0, "pause_sent": 0.1, "pause_para": 0.4,
@@ -218,9 +250,9 @@ class App:
                 remote = fetch_available_models()
                 new_versions = [v for v in remote if v not in AVAILABLE_MODELS]
                 AVAILABLE_MODELS.update(remote)
-                self.root.after(0, lambda: self._on_updates_checked(new_versions))
+                self.post_ui(self._on_updates_checked, new_versions)
             except Exception as e:
-                self.root.after(0, lambda: self.status_var.set(f"Не удалось проверить обновления: {e}"))
+                self.post_ui(self.status_var.set, f"Не удалось проверить обновления: {e}")
         threading.Thread(target=_check, daemon=True).start()
 
     def _on_updates_checked(self, new_versions):
@@ -242,7 +274,7 @@ class App:
         self.status_var.set(f"Загрузка модели {version}...")
         self.load_engine()
 
-    def _on_engine_error(self, version):
+    def _on_engine_error(self, version, error=""):
         # Откат на предыдущую рабочую модель, если новая не загрузилась.
         # Повторная попытка делается только один раз, чтобы избежать цикла.
         if not self._fallback_attempted:
@@ -255,6 +287,7 @@ class App:
             self.load_engine()
         else:
             self.status_var.set(f"Не удалось загрузить модель {version}")
+            messagebox.showerror("Ошибка модели", f"Не удалось загрузить модель {version}:\n{error}")
 
     def open_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
@@ -413,9 +446,9 @@ class App:
         def _load():
             try:
                 self.engine = SileroEngine(version)
-                self.root.after(0, self._on_engine_ready)
-            except Exception:
-                self.root.after(0, lambda: self._on_engine_error(version))
+                self.post_ui(self._on_engine_ready)
+            except Exception as e:
+                self.post_ui(self._on_engine_error, version, str(e))
         threading.Thread(target=_load, daemon=True).start()
 
     def _on_engine_ready(self):
@@ -502,8 +535,8 @@ class App:
                 if self.stop_requested: break
                 self.current_seg_idx = i
                 if i % 5 == 0: self.save_settings()
-                self.root.after(0, lambda s=seg: self.set_highlight(s["start_idx"], s["end_idx"]))
-                self.status_var.set(f"Читаю: {i+1} из {total}")
+                self.post_ui(self.set_highlight, seg["start_idx"], seg["end_idx"])
+                self.post_ui(self.status_var.set, f"Читаю: {i+1} из {total}")
                 if audio is not None:
                     sd.play(audio, SAMPLE_RATE)
                     while sd.get_stream().active and not self.stop_requested: time.sleep(0.05)
@@ -513,7 +546,7 @@ class App:
         finally:
             self.is_playing = False
             self.save_settings()
-            self.root.after(0, self._reset_ui_after_reading)
+            self.post_ui(self._reset_ui_after_reading)
 
     def _reset_ui_after_reading(self):
         text = "▶ Продолжить" if self.current_seg_idx > 0 else "▶ Читать"
@@ -558,7 +591,7 @@ class App:
                         audio_data = self.engine.apply_tts(seg["text"], self.settings["voice"], self.settings["speed"])
                         processed_count = sum(1 for r in results if r is not None)
                         percent = int((processed_count / total) * 100)
-                        self.root.after(0, lambda p=percent: self.btns["💾 В MP3"].config(text=f"💾 [{p}%]"))
+                        self.post_ui(self.btns["💾 В MP3"].config, text=f"💾 [{percent}%]")
                         return audio_data
                     except: return None
                 with ThreadPoolExecutor(max_workers=4) as executor:
@@ -574,12 +607,12 @@ class App:
                         if segments[i]["pause"] > 0:
                             combined += AudioSegment.silent(duration=int(segments[i]["pause"] * 1000), frame_rate=SAMPLE_RATE)
                 combined.export(file_path, format="mp3")
-                self.root.after(0, lambda: messagebox.showinfo("Успех", f"Сохранено: {os.path.basename(file_path)}"))
+                self.post_ui(messagebox.showinfo, "Успех", f"Сохранено: {os.path.basename(file_path)}")
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+                self.post_ui(messagebox.showerror, "Ошибка", str(e))
             finally:
-                self.root.after(0, lambda: self.btns["💾 В MP3"].config(state=tk.NORMAL, text="💾 В MP3"))
-                self.root.after(0, lambda: self.status_var.set("Готов"))
+                self.post_ui(self.btns["💾 В MP3"].config, state=tk.NORMAL, text="💾 В MP3")
+                self.post_ui(self.status_var.set, "Готов")
         threading.Thread(target=_export, daemon=True).start()
 
 if __name__ == "__main__":
